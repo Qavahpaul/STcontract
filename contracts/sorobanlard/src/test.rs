@@ -14144,3 +14144,210 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ISSUES #55-#58: CATALOG, BLANK IDS, ARCHIVED ID REUSE, REVIEW DELAY
+// ============================================================
+
+fn try_register(
+    env: &Env,
+    client: &SorobanLardContractClient,
+    token_id: &Address,
+    instructor: &Address,
+    course_id: &str,
+) -> bool {
+    client
+        .try_register_course(
+            instructor,
+            &String::from_str(env, course_id),
+            &100_000_000,
+            token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(env),
+        )
+        .is_ok()
+}
+
+#[test]
+fn test_list_courses_includes_active_archived_and_expired_entries() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    for id in ["CAT-ACTIVE", "CAT-ARCHIVED", "CAT-EXPIRED"] {
+        register_and_approve_course(&env, &client, &token_id, &admin, &instructor, id, 100_000_000);
+    }
+    let archived = String::from_str(&env, "CAT-ARCHIVED");
+    let expired = String::from_str(&env, "CAT-EXPIRED");
+
+    client.pause_course(&admin, &archived);
+    client.archive_course(&admin, &sec_admin, &archived, &None);
+
+    let now = env.ledger().sequence();
+    client.set_course_expiry(&admin, &expired, &Some(now + 1));
+    env.ledger().with_mut(|l| l.sequence_number = now + 10);
+
+    let page = client.list_courses(&0, &10);
+    assert_eq!(page.len(), 3);
+    assert_eq!(page.get(0).unwrap(), String::from_str(&env, "CAT-ACTIVE"));
+    assert_eq!(page.get(1).unwrap(), archived);
+    assert_eq!(page.get(2).unwrap(), expired);
+
+    // Listed IDs resolve via get_course; callers filter by status.
+    assert_eq!(
+        client.get_course(&String::from_str(&env, "CAT-ACTIVE")).unwrap().status,
+        CourseStatus::Active
+    );
+    assert_eq!(client.get_course(&archived).unwrap().status, CourseStatus::Archived);
+    let exp = client.get_course(&expired).unwrap();
+    assert_eq!(exp.status, CourseStatus::Active);
+    assert!(exp.expires_at_ledger.unwrap() < env.ledger().sequence());
+
+    // IDs that were never registered are not listed and resolve to None.
+    assert!(client.get_course(&String::from_str(&env, "CAT-MISSING")).is_none());
+}
+
+#[test]
+fn test_register_rejects_empty_and_whitespace_only_course_ids() {
+    let (env, contract_id, token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    for bad in ["", " ", "   "] {
+        assert!(
+            !try_register(&env, &client, &token_id, &instructor, bad),
+            "blank course id {:?} must be rejected",
+            bad
+        );
+    }
+
+    // No capacity consumed and nothing appended to the catalog.
+    assert_eq!(client.get_instructor_course_count(&instructor), 0);
+    assert_eq!(client.list_courses(&0, &10).len(), 0);
+
+    // IDs containing (but not consisting only of) spaces remain valid.
+    assert!(try_register(&env, &client, &token_id, &instructor, " A B "));
+    assert_eq!(client.get_instructor_course_count(&instructor), 1);
+    assert_eq!(client.list_courses(&0, &10).len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "course_id cannot be blank")]
+fn test_register_whitespace_only_course_id_panics_with_message() {
+    let (env, contract_id, token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "    "),
+        &100_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+}
+
+#[test]
+fn test_archived_course_id_reuse_does_not_overwrite_archive_or_duplicate_catalog() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let id = "COURSE-REUSE";
+    let course_id = String::from_str(&env, id);
+
+    register_and_approve_course(&env, &client, &token_id, &admin, &instructor, id, 100_000_000);
+    client.pause_course(&admin, &course_id);
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+    let archived_at = client.get_course(&course_id).unwrap().archived_at_ledger.unwrap();
+
+    // During the cooldown, reuse is rejected and nothing changes.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archived_at + SorobanLardContract::ARCHIVE_COOLDOWN_LEDGERS - 1;
+    });
+    assert!(!try_register(&env, &client, &token_id, &instructor, id));
+    assert_eq!(client.get_course(&course_id).unwrap().status, CourseStatus::Archived);
+    assert_eq!(client.list_courses(&0, &10).len(), 1);
+
+    // After the cooldown, reuse succeeds as a fresh Pending course.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = archived_at + SorobanLardContract::ARCHIVE_COOLDOWN_LEDGERS;
+    });
+    let other = Address::generate(&env);
+    assert!(try_register(&env, &client, &token_id, &other, id));
+
+    let current = client.get_course(&course_id).unwrap();
+    assert_eq!(current.status, CourseStatus::Pending);
+    assert_eq!(current.instructor, other);
+
+    // The archived record is preserved untouched.
+    let archived: Course = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArchivedCourse(course_id.clone()))
+            .unwrap()
+    });
+    assert_eq!(archived.status, CourseStatus::Archived);
+    assert_eq!(archived.instructor, instructor);
+    assert_eq!(archived.archived_at_ledger, Some(archived_at));
+
+    // The catalog still lists the ID exactly once.
+    let page = client.list_courses(&0, &10);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap(), course_id);
+}
+
+fn count_events(env: &Env, contract_id: &Address, name: &str) -> u32 {
+    let mut n = 0;
+    for (contract, topics, _) in env.events().all().iter() {
+        if contract != *contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        if sym == Symbol::new(env, name) {
+            n += 1;
+        }
+    }
+    n
+}
+
+#[test]
+fn test_approve_course_before_at_and_after_review_delay() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let delay = 100u32;
+    client.update_min_review_delay(&admin, &delay);
+
+    // Move well past the post-init governance window.
+    env.ledger().with_mut(|l| l.sequence_number += 1_000);
+    let start = env.ledger().sequence();
+
+    for id in ["DELAY-AT", "DELAY-AFTER"] {
+        assert!(try_register(&env, &client, &token_id, &instructor, id));
+    }
+    let at = String::from_str(&env, "DELAY-AT");
+    let after = String::from_str(&env, "DELAY-AFTER");
+
+    // Immediately before the delay: rejected, still Pending, no event.
+    env.ledger().with_mut(|l| l.sequence_number = start + delay - 1);
+    assert!(client.try_approve_course(&admin, &at).is_err());
+    assert_eq!(client.get_course(&at).unwrap().status, CourseStatus::Pending);
+    assert_eq!(count_events(&env, &contract_id, "course_approved"), 0);
+
+    // Exactly at the delay: eligible.
+    env.ledger().with_mut(|l| l.sequence_number = start + delay);
+    client.approve_course(&admin, &at);
+    assert_eq!(client.get_course(&at).unwrap().status, CourseStatus::Active);
+    assert_eq!(count_events(&env, &contract_id, "course_approved"), 1);
+
+    // After the delay: eligible.
+    env.ledger().with_mut(|l| l.sequence_number = start + delay + 50);
+    client.approve_course(&admin, &after);
+    assert_eq!(client.get_course(&after).unwrap().status, CourseStatus::Active);
+    assert!(count_events(&env, &contract_id, "course_approved") >= 1);
+    let (approved_id, _, _, approved_ledger): (String, Address, Address, u32) =
+        last_event_val(&env, &contract_id, "course_approved")
+            .try_into_val(&env)
+            .unwrap();
+    assert_eq!(approved_id, after);
+    assert_eq!(approved_ledger, start + delay + 50);
+}

@@ -1143,6 +1143,13 @@ impl SorobanLardContract {
             }
         }
 
+        // Whitespace-only IDs (e.g. "   ") are printable ASCII but carry no
+        // identity and are indistinguishable off-chain; reject them before any
+        // capacity counter or catalog entry is touched (#56).
+        if id_bytes.iter().all(|b| *b == b' ') {
+            panic!("course_id cannot be blank");
+        }
+
         // Validate categories (#165)
         if categories.len() > Self::MAX_CATEGORIES {
             panic!("register_course: too many categories");
@@ -1285,16 +1292,25 @@ impl SorobanLardContract {
             .set(&instructor_ref_key, &instructor);
         Self::extend_persistent_ttl(&env, &instructor_ref_key);
 
-        // Append to on-chain course catalog
-        let mut catalog: Vec<String> = env
+        // Append to on-chain course catalog. An ID reused after its archival
+        // cooldown is already in the catalog (archival never removes catalog
+        // entries), so it is not appended a second time (#57). The
+        // `ArchivedCourse` record is left untouched.
+        let reusing_archived_id = env
             .storage()
             .persistent()
-            .get(&DataKey::CourseList)
-            .unwrap_or_else(|| Vec::new(&env));
-        catalog.push_back(course_id.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::CourseList, &catalog);
+            .has(&DataKey::ArchivedCourse(course_id.clone()));
+        if !reusing_archived_id {
+            let mut catalog: Vec<String> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CourseList)
+                .unwrap_or_else(|| Vec::new(&env));
+            catalog.push_back(course_id.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::CourseList, &catalog);
+        }
         Self::extend_persistent_ttl(&env, &DataKey::CourseList);
 
         env.storage()
@@ -5466,6 +5482,16 @@ impl SorobanLardContract {
     /// - `limit`  — requested page size; values above `MAX_PAGE_SIZE` are clamped
     ///
     /// Returns an empty list when `offset` is beyond the end of the catalog.
+    ///
+    /// # Archived and expired entries (#55)
+    /// The catalog is append-only: every successfully registered ID is listed
+    /// exactly once, in registration order, regardless of status. Archived
+    /// IDs stay listed (their record moves to `ArchivedCourse` and is still
+    /// returned by `get_course` with `CourseStatus::Archived`), and courses
+    /// past `expires_at_ledger` stay listed unchanged. Callers must filter by
+    /// status via `get_course`. A listed ID whose record is missing (e.g. its
+    /// persistent entry was evicted) is still returned here; `get_course`
+    /// returns `None` for it. Rejected registrations never append an ID.
     pub fn list_courses(env: Env, offset: u32, limit: u32) -> Vec<String> {
         let catalog: Vec<String> = env
             .storage()
